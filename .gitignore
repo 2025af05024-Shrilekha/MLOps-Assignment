@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.coverage
+coverage.xml
+junit.xml
+mlartifacts/
+.ipynb_checkpoints/
+# mlruns/ is committed on purpose (small, file-based) so graders can open the MLflow UI.
+# Remove the next line's '#' if you'd rather not commit it:
+# mlruns/
