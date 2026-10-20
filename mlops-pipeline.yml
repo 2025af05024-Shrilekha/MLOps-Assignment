@@ -1,0 +1,207 @@
+name: mlops-pipeline
+
+# lint+test -> train (MLflow) -> docker build+smoke -> push to GHCR -> minikube deploy+scale -> monitoring
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_LOCAL: heart-risk-api:v1
+
+jobs:
+  # ------------------------------------------------------------------
+  lint-test:
+    name: 1 · Lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: flake8
+        run: flake8 . --count --show-source --statistics
+      - name: pytest
+        run: pytest --junitxml=junit.xml --cov=heartml --cov=api --cov-report=xml --cov-report=term-missing
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            junit.xml
+            coverage.xml
+
+  # ------------------------------------------------------------------
+  train:
+    name: 2 · Data, EDA & training (MLflow)
+    needs: lint-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Download & clean data
+        run: python -m heartml.data --force
+      - name: EDA
+        run: python -m heartml.eda
+      - name: Train & track
+        run: python -m heartml.train 2>&1 | tee train.log
+      - name: Check model quality gate (CV ROC-AUC >= 0.85)
+        run: |
+          python - <<'EOF'
+          import json, sys
+          m = json.load(open("models/model_meta.json"))
+          auc = m["cv_metrics"]["cv_roc_auc_mean"]
+          print(f"best={m['model_name']} cv_roc_auc={auc:.4f}")
+          sys.exit(0 if auc >= 0.85 else "Model below quality gate")
+          EOF
+      - name: Job summary
+        run: |
+          python - >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json
+          m = json.load(open("models/model_meta.json"))
+          print("## Model comparison\n\n| model | CV ROC-AUC | test ROC-AUC | test accuracy |\n|---|---|---|---|")
+          for k, v in m["comparison"].items():
+              print(f"| {k} | {v['cv_roc_auc']} | {v['test_roc_auc']} | {v['test_accuracy']} |")
+          print(f"\n**Selected:** `{m['model_name']}`  params `{m['best_params']}`")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: models/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: training-reports
+          path: |
+            reports/
+            data/processed/heart_clean.csv
+            mlruns/
+            train.log
+
+  # ------------------------------------------------------------------
+  docker:
+    name: 3 · Docker build, run & push to GHCR
+    needs: train
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: models/
+      - name: Build image
+        run: docker build -t $IMAGE_LOCAL .
+      - name: Run container & smoke test
+        run: |
+          docker run -d --name heart-api -p 8000:8000 $IMAGE_LOCAL
+          scripts/smoke_test.sh http://localhost:8000
+      - name: Container logs
+        if: always()
+        run: docker logs heart-api || true
+      - name: Save image for the k8s job
+        run: docker save $IMAGE_LOCAL -o heart-risk-api.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: heart-risk-api.tar
+          retention-days: 3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag & push
+        if: github.event_name != 'pull_request'
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO=ghcr.io/$OWNER/heart-risk-api
+          for TAG in latest v1 sha-${GITHUB_SHA::7}; do
+            docker tag $IMAGE_LOCAL $REPO:$TAG
+            docker push $REPO:$TAG
+          done
+          echo "Pushed $REPO (latest, v1, sha-${GITHUB_SHA::7})" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  k8s:
+    name: 4 · Minikube deploy, scale & monitoring
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+      - name: Start minikube
+        uses: medyagh/setup-minikube@latest
+        with:
+          cpus: 2
+          memory: 6000m
+      - name: Load image into minikube node
+        run: |
+          minikube image load heart-risk-api.tar
+          minikube image ls | grep heart-risk-api
+      - name: Deploy API
+        run: |
+          kubectl apply -f k8s/app/namespace.yaml
+          kubectl apply -f k8s/app/deployment.yaml -f k8s/app/service.yaml -f k8s/app/ingress.yaml
+          kubectl -n heart-risk rollout status deployment/heart-api --timeout=180s
+      - name: Scale to 3 replicas
+        run: |
+          kubectl -n heart-risk scale deployment/heart-api --replicas=3
+          kubectl -n heart-risk rollout status deployment/heart-api --timeout=180s
+          test "$(kubectl -n heart-risk get deploy heart-api -o jsonpath='{.status.readyReplicas}')" = "3"
+      - name: Smoke test through the Service
+        run: |
+          kubectl -n heart-risk port-forward svc/heart-api 8080:80 &
+          sleep 5
+          scripts/smoke_test.sh http://localhost:8080
+          python scripts/generate_traffic.py --url http://localhost:8080 --n 60 --delay 0.05
+      - name: Deploy Prometheus & Grafana
+        run: |
+          docker pull prom/prometheus:v2.54.1
+          docker pull grafana/grafana:11.2.0
+          minikube image load prom/prometheus:v2.54.1
+          minikube image load grafana/grafana:11.2.0
+          kubectl apply -k k8s/monitoring
+          kubectl -n monitoring rollout status deployment/prometheus --timeout=240s
+          kubectl -n monitoring rollout status deployment/grafana --timeout=240s
+      - name: Verify Prometheus scrapes all 3 API pods
+        run: |
+          kubectl -n monitoring port-forward svc/prometheus 9090:9090 &
+          sleep 5
+          for i in $(seq 1 12); do
+            UP=$(curl -s 'http://localhost:9090/api/v1/query?query=sum(up{job="heart-api"})' \
+                 | python -c 'import sys,json; r=json.load(sys.stdin)["data"]["result"]; print(int(float(r[0]["value"][1])) if r else 0)')
+            echo "pods up: $UP"; [ "$UP" = "3" ] && exit 0; sleep 10
+          done
+          echo "Prometheus did not see 3 healthy targets"; exit 1
+      - name: Collect cluster state
+        if: always()
+        run: |
+          mkdir -p k8s-report
+          kubectl get all -A -o wide > k8s-report/get-all.txt 2>&1 || true
+          kubectl -n heart-risk describe deploy heart-api > k8s-report/describe-api.txt 2>&1 || true
+          kubectl -n heart-risk logs -l app=heart-api --tail=100 > k8s-report/api-logs.txt 2>&1 || true
+          kubectl get events -A --sort-by=.lastTimestamp > k8s-report/events.txt 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k8s-report
+          path: k8s-report/

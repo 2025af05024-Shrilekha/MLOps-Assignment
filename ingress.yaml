@@ -1,0 +1,18 @@
+# Requires: minikube addons enable ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: heart-api
+  namespace: heart-risk
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: heart-api.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: heart-api
+                port: {number: 80}

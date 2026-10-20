@@ -1,0 +1,20 @@
+# kubectl apply -k k8s/monitoring
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: monitoring
+resources:
+  - namespace.yaml
+  - prometheus.yaml
+  - grafana.yaml
+configMapGenerator:
+  - name: prometheus-config
+    files: [prometheus.yml, alerts.yml]
+  - name: grafana-datasources
+    files: [datasources.yml=grafana-datasources.yml]
+  - name: grafana-dashboard-provider
+    files: [provider.yml=grafana-dashboard-provider.yml]
+  - name: grafana-dashboards
+    files: [heart-api.json=grafana-dashboard.json]
+secretGenerator:
+  - name: grafana-admin
+    literals: [password=HeartRisk@2026]   # demo only - change for anything real
